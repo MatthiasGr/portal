@@ -37,10 +37,10 @@
       in
       {
         packages = rec {
-          adit = naersk'.buildPackage {
+          portal = naersk'.buildPackage {
             src = ./.;
           };
-          default = adit;
+          default = portal;
         };
 
         devShells.default = pkgs.mkShell {
