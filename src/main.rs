@@ -1,20 +1,25 @@
-use std::{borrow::Cow, error::Error, io, net::SocketAddr, str::FromStr};
+use std::{borrow::Cow, net::SocketAddr, str::FromStr, time::Duration};
 
 use futures::{SinkExt, StreamExt};
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     task,
+    time::timeout,
 };
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::instrument;
 
-use crate::protocol::{
-    PacketDecoder, PacketEncoder,
-    handshake::{HandshakePacket, NextState},
-    login, status,
+use crate::{
+    error::Error,
+    protocol::{
+        PacketDecoder, PacketEncoder,
+        handshake::{HandshakePacket, NextState},
+        login, status,
+    },
 };
 
+mod error;
 mod protocol;
 
 const STATUS_RESPONSE: &'static str = r#"{
@@ -34,10 +39,10 @@ const STATUS_RESPONSE: &'static str = r#"{
 async fn status_handler<Read: AsyncRead + Unpin, Write: AsyncWrite + Unpin>(
     mut reader: FramedRead<Read, PacketDecoder<status::ServerBound>>,
     mut writer: FramedWrite<Write, PacketEncoder<status::ClientBound<'_>>>,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     let mut status_sent = false;
     let mut ping_sent = false;
-    while let Some(req) = reader.next().await
+    while let Some(req) = timeout(Duration::from_secs(5), reader.next()).await?
         && !ping_sent
     {
         // TODO: When up, just forward
@@ -45,7 +50,7 @@ async fn status_handler<Read: AsyncRead + Unpin, Write: AsyncWrite + Unpin>(
         let resp = match *req {
             status::ServerBound::StatusRequest => {
                 if status_sent {
-                    tracing::debug!("Invalid status response");
+                    tracing::debug!("Connection sent more than one status request");
                     break;
                 }
                 status_sent = true;
@@ -69,9 +74,9 @@ async fn status_handler<Read: AsyncRead + Unpin, Write: AsyncWrite + Unpin>(
 async fn login_handler<Read: AsyncRead + Unpin, Write: AsyncWrite + Unpin>(
     mut reader: FramedRead<Read, PacketDecoder<login::ServerBound<'_>>>,
     mut writer: FramedWrite<Write, PacketEncoder<login::ClientBound<'_>>>,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     let mut disconnect_sent = false;
-    while let Some(req) = reader.next().await
+    while let Some(req) = timeout(Duration::from_secs(5), reader.next()).await?
         && !disconnect_sent
     {
         let req = req?;
@@ -94,24 +99,39 @@ async fn login_handler<Read: AsyncRead + Unpin, Write: AsyncWrite + Unpin>(
 }
 
 #[instrument(skip_all)]
-async fn connection_handler(mut socket: TcpStream, peer: &SocketAddr) -> io::Result<()> {
+async fn connection_handler(
+    mut socket: TcpStream,
+    peer: &SocketAddr,
+    forward_addr: &SocketAddr,
+) -> Result<(), Error> {
     let (read_half, write_half) = socket.split();
 
     let mut reader = FramedRead::new(read_half, PacketDecoder::<HandshakePacket<'_>>::new());
     // The FramedRead interface is not really ideal for single packets, but oh well
-    let handshake_packet = reader
-        .next()
-        .await
+    let handshake_packet = timeout(Duration::from_secs(5), reader.next())
+        .await?
         .ok_or(io::Error::from(io::ErrorKind::UnexpectedEof))
         .and_then(|r| r)?;
 
     tracing::info!(
-        peer = display(peer),
-        server = display(&handshake_packet.address),
-        port = display(handshake_packet.port),
-        next_state = display(handshake_packet.next_state),
+        peer = %peer,
+        server = %&handshake_packet.address,
+        port = %handshake_packet.port,
+        next_state = %handshake_packet.next_state,
         "Handling new connection from client"
     );
+
+    // TODO: At this point, we should look at the actual server location
+    if let Ok(mut forward) = TcpStream::connect(forward_addr).await {
+        tracing::debug!(peer = %peer, forward = %forward_addr, "Successfully connected to backend");
+        forward.write_all(&handshake_packet.buffer()).await?;
+        drop(handshake_packet);
+
+        io::copy_bidirectional(&mut socket, &mut forward).await?;
+        return Ok(());
+    }
+
+    tracing::debug!(peer = %peer, backend = %forward_addr, "Forward is down, reply with custom messages");
 
     // We drop the handshake packet as soon as possible to reclaim space in the receive buffer
     let next_state = handshake_packet.next_state;
@@ -138,30 +158,29 @@ async fn connection_handler(mut socket: TcpStream, peer: &SocketAddr) -> io::Res
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt::init();
 
     // Preliminary command line handling, will be improved later
     let args = std::env::args().collect::<Vec<_>>();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <listen address>", args[0]);
+    if args.len() != 3 {
+        eprintln!("Usage: {} <listen address> <forward address>", args[0]);
         return Err("invalid command line arguments".into());
     }
 
-    let addr = SocketAddr::from_str(&args[1]).map_err(|_| "could not parse listen address")?;
+    let listen_addr =
+        SocketAddr::from_str(&args[1]).map_err(|_| "could not parse listen address")?;
+    let forward_addr =
+        SocketAddr::from_str(&args[2]).map_err(|_| "could not parse forward address")?;
 
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!(address = display(addr), "Accepting TCP connections");
+    let listener = TcpListener::bind(listen_addr).await?;
+    tracing::info!(address = %listen_addr, "Accepting TCP connections");
 
     loop {
         let (socket, peer) = listener.accept().await?;
         task::spawn(async move {
-            if let Err(err) = connection_handler(socket, &peer).await {
-                tracing::error!(
-                    error = display(err),
-                    peer = display(peer),
-                    "Error in connection handler"
-                )
+            if let Err(err) = connection_handler(socket, &peer, &forward_addr).await {
+                tracing::error!(error = %err, peer = %peer, "Error in connection handler")
             }
         });
     }

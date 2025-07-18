@@ -30,7 +30,13 @@ pub trait Protocol<'a>: Sized {
 /// be longe lived.
 pub struct Packet<T> {
     data: T,
-    _bytes: Bytes,
+    bytes: Bytes,
+}
+
+impl<T> Packet<T> {
+    pub fn buffer(&self) -> Bytes {
+        self.bytes.clone()
+    }
 }
 
 impl<T> Deref for Packet<T> {
@@ -153,7 +159,7 @@ where
         self.needed = None;
         Ok(Some(Packet {
             data: packet,
-            _bytes: src.split_to(state.offset).freeze(),
+            bytes: src.split_to(state.offset).freeze(),
         }))
     }
 }
