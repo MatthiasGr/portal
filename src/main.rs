@@ -1,4 +1,4 @@
-use std::{borrow::Cow, net::SocketAddr, str::FromStr, time::Duration};
+use std::{borrow::Cow, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use futures::{SinkExt, StreamExt};
 use tokio::{
@@ -12,6 +12,7 @@ use tracing::instrument;
 
 use crate::{
     error::Error,
+    external_process::ExternalProcess,
     protocol::{
         PacketDecoder, PacketEncoder,
         handshake::{HandshakePacket, NextState},
@@ -20,6 +21,7 @@ use crate::{
 };
 
 mod error;
+mod external_process;
 mod protocol;
 
 const STATUS_RESPONSE: &'static str = r#"{
@@ -88,7 +90,9 @@ async fn login_handler<Read: AsyncRead + Unpin, Write: AsyncWrite + Unpin>(
                     "Player connected"
                 );
                 disconnect_sent = true;
-                login::ClientBound::Disconnect(Cow::Borrowed("\"Login is not implemented\""))
+                login::ClientBound::Disconnect(Cow::Borrowed(
+                    "\"Server is starting, please try again later\"",
+                ))
             }
         };
         writer.send(resp).await?;
@@ -103,6 +107,7 @@ async fn connection_handler(
     mut socket: TcpStream,
     peer: &SocketAddr,
     forward_addr: &SocketAddr,
+    start_command: Arc<ExternalProcess>,
 ) -> Result<(), Error> {
     let (read_half, write_half) = socket.split();
 
@@ -131,7 +136,8 @@ async fn connection_handler(
         return Ok(());
     }
 
-    tracing::debug!(peer = %peer, backend = %forward_addr, "Forward is down, reply with custom messages");
+    tracing::debug!(peer = %peer, backend = %forward_addr, "Forward is down, running start command");
+    start_command.spawn_once().await?;
 
     // We drop the handshake packet as soon as possible to reclaim space in the receive buffer
     let next_state = handshake_packet.next_state;
@@ -163,8 +169,11 @@ async fn main() -> Result<(), Error> {
 
     // Preliminary command line handling, will be improved later
     let args = std::env::args().collect::<Vec<_>>();
-    if args.len() != 3 {
-        eprintln!("Usage: {} <listen address> <forward address>", args[0]);
+    if args.len() != 4 {
+        eprintln!(
+            "Usage: {} <listen address> <forward address> <start command>",
+            args[0]
+        );
         return Err("invalid command line arguments".into());
     }
 
@@ -172,14 +181,16 @@ async fn main() -> Result<(), Error> {
         SocketAddr::from_str(&args[1]).map_err(|_| "could not parse listen address")?;
     let forward_addr =
         SocketAddr::from_str(&args[2]).map_err(|_| "could not parse forward address")?;
+    let start_command = Arc::new(ExternalProcess::new(args[3].clone()));
 
     let listener = TcpListener::bind(listen_addr).await?;
     tracing::info!(address = %listen_addr, "Accepting TCP connections");
 
     loop {
         let (socket, peer) = listener.accept().await?;
+        let cmd = Arc::clone(&start_command);
         task::spawn(async move {
-            if let Err(err) = connection_handler(socket, &peer, &forward_addr).await {
+            if let Err(err) = connection_handler(socket, &peer, &forward_addr, cmd).await {
                 tracing::error!(error = %err, peer = %peer, "Error in connection handler")
             }
         });
